@@ -8,22 +8,12 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from vllm.config import ParallelConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import EngineId
 from vllm.logger import init_logger
 
 WorkerAddr = str
 
 logger = init_logger(__name__)
-
-
-def get_mooncake_dp_engine_index(parallel_config: ParallelConfig) -> int:
-    """Return the per-engine DP index used for Mooncake side channels."""
-    if parallel_config.local_engines_only:
-        assert parallel_config.data_parallel_rank_local is not None
-        return parallel_config.data_parallel_rank_local
-
-    return parallel_config.data_parallel_index
 
 
 class RegisterWorkerPayload(BaseModel):
@@ -42,8 +32,7 @@ class EngineEntry:
 
 
 class MooncakeBootstrapServer:
-    """
-    A centralized server running on the global rank 0 prefiller worker.
+    """A centralized server running on the global rank 0 prefiller worker.
     Prefiller workers register their connection info (IP, port, ranks) here.
     """
 
@@ -108,14 +97,19 @@ class MooncakeBootstrapServer:
             dp_entry.worker_addr[payload.tp_rank] = {}
 
         tp_entry = dp_entry.worker_addr[payload.tp_rank]
-        if payload.pp_rank in tp_entry:
+        existing = tp_entry.get(payload.pp_rank)
+        if existing is not None:
+            # A client timeout can fire after the server recorded the
+            # registration so an identical retry must not be an error.
+            if existing == payload.addr:
+                return {"status": "ok"}
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"Worker with dp_rank={payload.dp_rank}, "
                     f"tp_rank={payload.tp_rank}, pp_rank={payload.pp_rank} "
                     f"is already registered at "
-                    f"{tp_entry[payload.pp_rank]}, "
+                    f"{existing}, "
                     f"but still want to register at {payload.addr}"
                 ),
             )

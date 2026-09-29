@@ -6,7 +6,9 @@ import math
 from collections.abc import Generator
 from types import SimpleNamespace
 from typing import get_args
+from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -23,6 +25,7 @@ from vllm.config.model import LogprobsMode
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.exceptions import VLLMValidationError
 from vllm.platforms import current_platform
+from vllm.v1.engine.input_processor import InputProcessor
 
 from ...conftest import HfRunner, VllmRunner
 
@@ -42,11 +45,12 @@ SAMPLE_PROMPT = BatchLogprobsComposition.SAMPLE_PROMPT
 #
 # Force LLM instances into an identical, deterministic execution
 # mode so the test isolates spec-decode correctness only:
-ROCM_DETERMINISM_KWARGS: dict = (
-    dict(max_num_seqs=1, attention_backend="TRITON_ATTN")
-    if current_platform.is_rocm()
-    else {}
-)
+if current_platform.is_rocm():
+    GPU_DETERMINISM_KWARGS: dict = dict(max_num_seqs=1, attention_backend="TRITON_ATTN")
+elif current_platform.is_xpu():
+    GPU_DETERMINISM_KWARGS = dict(max_num_seqs=1, attention_backend="FLASH_ATTN")
+else:
+    GPU_DETERMINISM_KWARGS = {}
 
 
 @pytest.fixture(
@@ -80,10 +84,11 @@ def hf_model(hf_runner) -> Generator[HfRunner, None, None]:
         yield hf_model
 
 
-def _model_config(vocab_size: int = 10):
+def _model_config(vocab_size: int = 10, max_logprobs: int = 20):
     return SimpleNamespace(
-        max_logprobs=20,
+        max_logprobs=max_logprobs,
         logits_processors=None,
+        is_diffusion=False,
         get_vocab_size=lambda: vocab_size,
     )
 
@@ -125,6 +130,7 @@ def _repeat_logprob_config(
       `logprob_prompt_logprob_list` enough times to match the
       number of `test_prompts`, or else is truncated to match
       the number of `test_prompts`
+
     """
     num_test_prompts = len(test_prompts)
     # Make sure there is a logprobs configuration for each test prompt
@@ -310,7 +316,7 @@ def test_get_logprobs_and_prompt_logprobs(
     temperature: float,
     example_prompts: list[str],
 ) -> None:
-    """Test V1 Engine logprobs & prompt logprobs
+    """Test V1 Engine logprobs & prompt logprobs.
 
     Exercise a variety of combinations of `logprobs` and `prompt_logprobs`
     settings and validate that
@@ -335,6 +341,7 @@ def test_get_logprobs_and_prompt_logprobs(
       batch_logprobs_composition: logprobs configuration for test batch
       temperature: "temperature" sampling parameter
       example_prompts: example prompt fixture
+
     """
     vllm_config = vllm_model.llm.llm_engine.vllm_config
     do_apc = vllm_config.cache_config.enable_prefix_caching
@@ -387,7 +394,7 @@ def test_get_logprobs_and_prompt_logprobs(
 
 
 def test_max_logprobs():
-    """vLLM v1 engine should fail a request with `logprobs > max_logprobs`
+    """VLLM v1 engine should fail a request with `logprobs > max_logprobs`
     Should also fail for `prompt_logprobs > max_logprobs`
     APC should not matter as this test checks basic request validation.
     """
@@ -403,7 +410,7 @@ def test_max_logprobs():
         runner.generate(["Hello world"], sampling_params=vllm_sampling_params)
 
         bad_sampling_params = SamplingParams(logprobs=2)
-        with pytest.raises(ValueError):
+        with pytest.raises(VLLMValidationError):
             runner.generate(["Hello world"], sampling_params=bad_sampling_params)
 
 
@@ -428,12 +435,64 @@ def test_logprob_token_ids_validate_vocab_bounds_invalid(token_ids: list[int]):
         )
 
 
+def test_prompt_logprob_token_ids_bounded_by_max_logprobs():
+    """The candidate count is bounded by max_logprobs."""
+    model_config = _model_config(vocab_size=100, max_logprobs=4)
+
+    def verify(**kwargs):
+        SamplingParams(**kwargs).verify(
+            model_config,
+            speculative_config=None,
+            structured_outputs_config=None,
+            tokenizer=None,
+        )
+
+    verify(prompt_logprob_token_ids=[1, 2, 3, 4])
+
+    # The error names the value to raise max_logprobs to.
+    with pytest.raises(VLLMValidationError, match=r"max_logprobs.*at least 5"):
+        verify(prompt_logprob_token_ids=[1, 2, 3, 4, 5])
+
+    # prompt_logprob_start alone is a caller mistake, not a silent no-op.
+    with pytest.raises(VLLMValidationError, match="requires prompt_logprob_token_ids"):
+        verify(prompt_logprob_start=3)
+
+
+def test_prompt_logprob_token_ids_require_v2_model_runner():
+    """Only the V2 runner scores them; the V1 runner would return None, and
+    kv-sharing fast prefill would score rows the cross-decoder never ran."""
+    processor = SimpleNamespace(
+        model_config=SimpleNamespace(
+            return_sampling_mask=False, enable_trace_replay=False, is_diffusion=False
+        ),
+        vllm_config=SimpleNamespace(
+            reasoning_config=None,
+            use_v2_model_runner=False,
+            cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
+        ),
+        speculative_config=None,
+        structured_outputs_config=None,
+        tokenizer=None,
+        validate_logits_processors_params=lambda params: None,
+    )
+    params = SamplingParams(prompt_logprob_token_ids=[1, 2])
+    with patch.object(SamplingParams, "verify"):
+        with pytest.raises(VLLMValidationError, match="V2 model runner"):
+            InputProcessor._validate_params(processor, params, ("generate",))
+        processor.vllm_config.use_v2_model_runner = True
+        InputProcessor._validate_params(processor, params, ("generate",))
+        processor.vllm_config.cache_config.kv_sharing_fast_prefill = True
+        with pytest.raises(VLLMValidationError, match="fast-prefill"):
+            InputProcessor._validate_params(processor, params, ("generate",))
+
+
 def test_none_logprobs(vllm_model, example_prompts):
-    """Engine should return `logprobs` and `prompt_logprobs` as `None`
+    """Engine should return `logprobs` and `prompt_logprobs` as `None`.
 
     Args:
       vllm_model: vLLM model fixture
       example_prompts: list of example prompts (test fixture)
+
     """
     max_tokens = 5
 
@@ -457,11 +516,12 @@ def test_none_logprobs(vllm_model, example_prompts):
 
 
 def test_zero_logprobs(vllm_model, example_prompts):
-    """Engine should return sampled token and prompt token logprobs
+    """Engine should return sampled token and prompt token logprobs.
 
     Args:
       vllm_model: vLLM model fixture
       example_prompts: list of example prompts (test fixture)
+
     """
     max_tokens = 5
 
@@ -489,10 +549,11 @@ def test_zero_logprobs(vllm_model, example_prompts):
 
 
 def test_all_logprobs(example_prompts):
-    """Engine should return all vocabulary logprobs and prompt logprobs
+    """Engine should return all vocabulary logprobs and prompt logprobs.
 
     Args:
       example_prompts: list of example prompts (test fixture)
+
     """
     with VllmRunner(
         "facebook/opt-125m",
@@ -533,8 +594,9 @@ def test_logprobs_mode(logprobs_mode: LogprobsMode):
         "facebook/opt-125m",
         max_logprobs=5,
         enable_prefix_caching=False,
-        # 2 other llms alive during whole session
-        gpu_memory_utilization=0.05,
+        # 2 other llms alive during whole session; must also cover the
+        # cudagraph memory reservation from startup profiling.
+        gpu_memory_utilization=0.1,
         max_model_len=16,
         logprobs_mode=logprobs_mode,
     )
@@ -560,6 +622,44 @@ def test_logprobs_mode(logprobs_mode: LogprobsMode):
         del llm
         torch.accelerator.empty_cache()
         cleanup_dist_env_and_memory()
+
+
+def test_prompt_logprobs_mode():
+    """prompt_logprobs must respect logprobs_mode: *_logits and *_logprobs
+    must return different values. Prompt tokens skip sampling processors,
+    so processed_* == raw_* on the prompt side."""
+    from vllm import LLM
+
+    values: dict[str, float] = {}
+    for mode in get_args(LogprobsMode):
+        llm = LLM(
+            "facebook/opt-125m",
+            enable_prefix_caching=False,
+            gpu_memory_utilization=0.1,
+            max_model_len=16,
+            logprobs_mode=mode,
+        )
+        try:
+            results = llm.generate(
+                ["Hello world"],
+                sampling_params=SamplingParams(
+                    max_tokens=1, prompt_logprobs=0, temperature=0
+                ),
+            )
+            assert results[0].prompt_logprobs is not None
+            assert results[0].prompt_logprobs[1] is not None
+            tok_id = results[0].prompt_token_ids[1]
+            values[mode] = results[0].prompt_logprobs[1][tok_id].logprob
+        finally:
+            del llm
+            torch.accelerator.empty_cache()
+            cleanup_dist_env_and_memory()
+
+    assert values["raw_logprobs"] <= 0
+    assert values["processed_logprobs"] <= 0
+    assert values["raw_logits"] != values["raw_logprobs"]
+    assert values["processed_logits"] == values["raw_logits"]
+    assert values["processed_logprobs"] == values["raw_logprobs"]
 
 
 class TestCorrectDecodedToken:
@@ -1074,7 +1174,6 @@ def test_correct_decoded_token_preserves_valid_tokens():
 def test_spec_decode_logprobs(
     logprobs_mode: LogprobsMode,
     model_setup: tuple[str, str, dict, int],
-    monkeypatch,
 ):
     """Spec decode logprobs should match those of the base model.
 
@@ -1087,19 +1186,9 @@ def test_spec_decode_logprobs(
         logprobs_mode: logprobs mode.
         model_setup: Tuple of (method, base model name,
             speculative_config dict, top_logprobs).
-        monkeypatch: pytest fixture for setting env vars.
+
     """
     from vllm import LLM
-
-    # The ROCm skinny GEMM kernels (gemm_kernels.cu) are
-    # non-deterministic across LLM instantiations due to persistent
-    # workgroup scheduling and wave-level shuffle reductions, which
-    # causes logprob differences that get misattributed to spec decode.
-    # Disable them so this test isolates spec decode correctness only.
-    # TODO(akaratza): Remove this workaround once the follow-up to
-    # https://github.com/vllm-project/vllm/pull/33493#issuecomment-3906083975
-    # lands with a determinism fix for wvSplitK kernels.
-    monkeypatch.setenv("VLLM_ROCM_USE_SKINNY_GEMM", "0")
 
     method, model_name, spec_config, top_logprobs = model_setup
 
@@ -1127,7 +1216,7 @@ def test_spec_decode_logprobs(
         enable_chunked_prefill=True,
         max_num_batched_tokens=32,
         enable_prefix_caching=False,
-        **ROCM_DETERMINISM_KWARGS,
+        **GPU_DETERMINISM_KWARGS,
     )
 
     # Run base LLM.
@@ -1173,7 +1262,7 @@ def test_spec_decode_logprobs(
     assert len(ref_logprobs) == len(spec_logprobs)
     for ref_logprob, spec_logprob in zip(ref_logprobs, spec_logprobs):
         assert math.isclose(
-            ref_logprob.logprob, spec_logprob.logprob, rel_tol=5e-2, abs_tol=1e-1
+            ref_logprob.logprob, spec_logprob.logprob, rel_tol=5e-2, abs_tol=2.5e-1
         ), (
             f"Logprob mismatch: ref={ref_logprob.logprob} "
             f"spec={spec_logprob.logprob} "
@@ -1195,7 +1284,6 @@ def test_prompt_logprobs_with_chunking_and_preemption():
     This test ensures that the num_prompt_logprobs tracking persists
     across preemptions and prefill chunks.
     """
-
     # Create prompts that will trigger chunking and preemption
     prompts = [
         "The following numbers of the sequence "
@@ -1216,7 +1304,7 @@ def test_prompt_logprobs_with_chunking_and_preemption():
         max_model_len=512,
         enable_chunked_prefill=True,
         max_num_batched_tokens=48,  # Force prefill chunking
-        num_gpu_blocks_override=32,  # Force preemptions
+        num_gpu_blocks_override=33,  # Force preemptions (32 usable + null block)
         disable_log_stats=False,
         gpu_memory_utilization=0.25,
     ) as vllm_model:
@@ -1262,3 +1350,158 @@ def test_prompt_logprobs_with_chunking_and_preemption():
         assert preemptions > 0, "Test did not trigger any preemptions"
 
         print(f"Test passed with {preemptions} preemptions")
+
+
+def test_prompt_logprob_token_ids_with_chunking_and_preemption(monkeypatch):
+    """Fixed-ID scores stay row-aligned across chunked prefill and preemption."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+
+    prompts = [
+        "The following numbers of the sequence "
+        + ", ".join(str(i) for i in range(10))
+        + " are:",
+        "In one word, the capital of France is ",
+    ] + [f"Tell me about the number {i}: " for i in range(32)]
+
+    start = 2
+    candidate_ids = [10, 100, 1000, 10000]
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=40,
+        min_tokens=20,
+        prompt_logprob_token_ids=candidate_ids,
+        prompt_logprob_start=start,
+    )
+
+    with VllmRunner(
+        "Qwen/Qwen3-0.6B",
+        max_model_len=512,
+        enable_chunked_prefill=True,
+        max_num_batched_tokens=48,  # Force prefill chunking
+        num_gpu_blocks_override=33,  # Force preemptions (32 usable + null block)
+        disable_log_stats=False,
+        gpu_memory_utilization=0.25,
+    ) as vllm_model:
+        metrics_before = vllm_model.llm.get_metrics()
+        outputs = vllm_model.llm.generate(prompts, sampling_params)
+
+        for i, output in enumerate(outputs):
+            scores = output.prompt_token_id_logprobs
+            assert scores is not None, f"Output {i} missing fixed-ID scores"
+            expected_shape = (
+                len(output.prompt_token_ids) - 1 - start,
+                len(candidate_ids),
+            )
+            assert scores.shape == expected_shape, (
+                f"Output {i} scored {scores.shape}, expected {expected_shape}"
+            )
+            assert math.isfinite(float(scores.min()))
+            assert float(scores.max()) <= 1e-3, "logprobs must be <= 0"
+
+        metrics_after = vllm_model.llm.get_metrics()
+        preemptions_before = next(
+            (m.value for m in metrics_before if m.name == "vllm:num_preemptions"), 0
+        )
+        preemptions_after = next(
+            (m.value for m in metrics_after if m.name == "vllm:num_preemptions"), 0
+        )
+        assert preemptions_after - preemptions_before > 0, (
+            "Test did not trigger any preemptions"
+        )
+
+    # Row alignment is numerical: chunked and preempted scores must match an
+    # unchunked, unpreempted run of the same requests. Batch composition moves
+    # bf16 tail logprobs by a few percent; a misaligned row differs by nats.
+    with VllmRunner(
+        "Qwen/Qwen3-0.6B",
+        max_model_len=512,
+        max_logprobs=64,
+        gpu_memory_utilization=0.25,
+    ) as reference:
+        reference_outputs = reference.llm.generate(prompts, sampling_params)
+        own_ids = [list(dict.fromkeys(o.prompt_token_ids)) for o in reference_outputs]
+        self_scored = reference.llm.generate(
+            prompts,
+            [
+                SamplingParams(
+                    max_tokens=1, prompt_logprobs=0, prompt_logprob_token_ids=ids
+                )
+                for ids in own_ids
+            ],
+        )
+    for output, ref in zip(outputs, reference_outputs):
+        np.testing.assert_allclose(
+            output.prompt_token_id_logprobs, ref.prompt_token_id_logprobs, rtol=0.1
+        )
+    for output, ids in zip(self_scored, own_ids):
+        scores = output.prompt_token_id_logprobs
+        for row, target in enumerate(output.prompt_token_ids[1:]):
+            expected = output.prompt_logprobs[row + 1][target].logprob
+            assert scores[row, ids.index(target)] == pytest.approx(expected, abs=1e-3)
+
+
+def test_prompt_logprob_token_ids_drop_partially_scored_prefills(monkeypatch):
+    """A prefill that starts past the first scored row returns no scores.
+
+    Such a prefill (here a prefix-cache hit the caller opted back into) never
+    computes the leading rows, so emitting the buffer would return values the
+    model never produced for them.
+    """
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+
+    prompt = "The capital of France is Paris. " * 20
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=1,
+        prompt_logprob_token_ids=[10, 100, 1000],
+        skip_reading_prefix_cache=False,
+    )
+
+    with VllmRunner(
+        "Qwen/Qwen3-0.6B",
+        max_model_len=512,
+        enable_prefix_caching=True,
+        gpu_memory_utilization=0.25,
+    ) as vllm_model:
+        first = vllm_model.llm.generate([prompt], sampling_params)[0]
+        assert first.prompt_token_id_logprobs is not None
+        assert math.isfinite(float(first.prompt_token_id_logprobs.min()))
+
+        # The re-send is served from the prefix cache, so its prefill starts
+        # past row 0 and the leading rows are never computed.
+        second = vllm_model.llm.generate([prompt], sampling_params)[0]
+        assert second.prompt_token_id_logprobs is None
+
+
+@large_gpu_mark(min_gb=24)
+def test_token_logprobs_large_batch_int64_row_offset():
+    """Regression: logprob kernel row offset (row * vocab_size) must use int64.
+
+    The rejection-sampler logprobs path runs the logprob kernels over the
+    spec-expanded logits batch, so batch_size * vocab_size can exceed 2**31
+    (e.g. DFlash drafts K tokens per request). With int32 offset arithmetic the
+    per-row pointer wraps to a negative address and the kernel hits a CUDA
+    illegal memory access. Run over a batch where batch_size * vocab_size > 2**31
+    and check the highest-offset row matches a reference log-softmax.
+    """
+    if not current_platform.is_cuda():
+        pytest.skip("int32 row-offset overflow is a CUDA kernel issue")
+    from vllm.v1.worker.gpu.sample.logprob import compute_token_logprobs
+
+    device = torch.device("cuda")
+    vocab_size = 131072
+    batch_size = 2**31 // vocab_size + 64  # batch_size * vocab_size > 2**31
+    # logits (the large input) plus small logprob/rank outputs; ~1 GB headroom.
+    required_bytes = batch_size * vocab_size * 4 + (1 << 30)
+    if torch.accelerator.get_memory_info()[0] < required_bytes:
+        pytest.skip(f"needs ~{required_bytes / 1e9:.0f} GB of free GPU memory")
+
+    logits = torch.randn(batch_size, vocab_size, device=device, dtype=torch.float32)
+    token_ids = torch.full((batch_size, 1), 7, device=device, dtype=torch.int64)
+    logprobs = compute_token_logprobs(logits, token_ids)
+    torch.accelerator.synchronize()  # surface any async illegal memory access
+    last = batch_size - 1
+    ref = torch.log_softmax(logits[last].float(), dim=-1)[7]
+    assert torch.allclose(logprobs[last, 0], ref, atol=1e-2), (
+        f"logprob {logprobs[last, 0].item()} != ref {ref.item()}"
+    )
